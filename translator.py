@@ -163,6 +163,27 @@ def cache_get(text, source, target):
     return None
 
 
+def clear_cache():
+    """Wipe the persistent translation cache. Use this once if a previous
+    run left failed segments cached as 'done' (see the note in
+    fetch_translation) - old versions of this script cached failures too,
+    so a prior bad run can make good segments look permanently finished."""
+    global _db_conn
+    with _MEM_CACHE_LOCK:
+        _MEM_CACHE.clear()
+    with _db_lock:
+        try:
+            if _db_conn is not None:
+                _db_conn.close()
+                _db_conn = None
+            if os.path.exists(_CACHE_DB_PATH):
+                os.remove(_CACHE_DB_PATH)
+        except Exception as e:
+            print(f"[translator] Could not clear cache: {e}", file=sys.stderr)
+            return False
+    return True
+
+
 def cache_set(text, source, target, value):
     with _MEM_CACHE_LOCK:
         _MEM_CACHE[(text, source, target)] = value
@@ -222,7 +243,7 @@ def _log_once(msg):
 # Batching means far fewer HTTP requests than one-per-line, so a smaller
 # number of *concurrent batch* workers is both faster and safer than
 # blasting one request per line with many threads.
-MAX_WORKERS = 8
+MAX_WORKERS = 4
 BATCH_MAX_ITEMS = 40
 BATCH_MAX_CHARS = 1800
 
@@ -291,8 +312,41 @@ _HEADERS = {
     "Accept": "*/*",
 }
 
+# ==========================================================================
+# GLOBAL RATE LIMITER
+#
+# translate.googleapis.com/translate_a/single is an unauthenticated, free
+# endpoint. It tolerates occasional requests fine, but once several worker
+# threads fire batches at roughly the same time, it starts answering with
+# HTTP 429 / empty responses for the whole burst.
+#
+# Symptom this caused: with MAX_WORKERS threads all submitting near the
+# start of a run, the *first* wave of batches (i.e. the beginning of the
+# document, for a normal top-to-bottom file) got throttled and fell back
+# to the low-quota secondary provider or the original text. Later batches,
+# submitted after earlier ones had already burned time in retry/backoff
+# sleeps, happened to land after the rate-limit window cooled down and
+# succeeded - so only the *end* of the file came out translated.
+#
+# Fix: force a minimum spacing between ANY two outgoing requests, across
+# every thread, so we simply never send a burst in the first place.
+# ==========================================================================
 
-def _translate_google(query_text, source, target, retries=4, timeout=10):
+_RATE_LIMIT_LOCK = threading.Lock()
+_LAST_REQUEST_AT = [0.0]
+_MIN_REQUEST_INTERVAL = 0.35  # seconds between outgoing requests, globally
+
+
+def _throttle():
+    with _RATE_LIMIT_LOCK:
+        now = time.time()
+        wait = _LAST_REQUEST_AT[0] + _MIN_REQUEST_INTERVAL - now
+        if wait > 0:
+            time.sleep(wait)
+        _LAST_REQUEST_AT[0] = time.time()
+
+
+def _translate_google(query_text, source, target, retries=5, timeout=10):
     """Primary provider. Returns translated string, or None on failure."""
     url = (
         "https://translate.googleapis.com/translate_a/single"
@@ -301,6 +355,7 @@ def _translate_google(query_text, source, target, retries=4, timeout=10):
     )
     last_err = None
     for attempt in range(retries):
+        _throttle()
         try:
             req = urllib.request.Request(url, headers=_HEADERS)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -312,6 +367,17 @@ def _translate_google(query_text, source, target, retries=4, timeout=10):
                         return html.unescape(joined)
             last_err = "empty response from Google Translate"
         except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # Rate-limited - back off longer than a generic HTTP error,
+                # and honor Retry-After if the server sent one.
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    delay = float(retry_after) if retry_after else (2.0 * (attempt + 1))
+                except (TypeError, ValueError):
+                    delay = 2.0 * (attempt + 1)
+                last_err = "HTTP 429 (rate limited) from Google Translate"
+                time.sleep(delay + random.uniform(0, 0.6))
+                continue
             last_err = f"HTTP {e.code} from Google Translate"
             time.sleep((1.2 * (attempt + 1)) + random.uniform(0, 0.5))
             continue
@@ -332,6 +398,7 @@ def _translate_mymemory(text, source, target, timeout=8):
     if source == "auto" or not text:
         return None
     try:
+        _throttle()
         langpair = f"{source}|{target}"
         url = (
             "https://api.mymemory.translated.net/get?q="
@@ -350,15 +417,46 @@ def _translate_mymemory(text, source, target, timeout=8):
     return None
 
 
+_LANG_SCRIPT_HINTS = [
+    (re.compile(r"[\u3040-\u30ff]"), "ja"),      # Hiragana/Katakana -> Japanese
+    (re.compile(r"[\uac00-\ud7a3]"), "ko"),      # Hangul -> Korean
+    (re.compile(r"[\u4e00-\u9fff]"), "zh-CN"),   # CJK ideographs (no kana) -> Chinese
+    (re.compile(r"[\u0e00-\u0e7f]"), "th"),      # Thai
+    (re.compile(r"[\u0600-\u06ff]"), "ar"),      # Arabic
+    (re.compile(r"[\u0400-\u04ff]"), "ru"),      # Cyrillic
+]
+
+
+def _guess_lang(text):
+    """Best-effort script-based source-language guess. MyMemory (the
+    fallback provider) refuses source='auto', so when the user has Auto
+    Detect selected and Google is the one failing, the fallback would
+    otherwise never engage at all. This only needs to be roughly right."""
+    for pat, code in _LANG_SCRIPT_HINTS:
+        if pat.search(text):
+            return code
+    return "en"
+
+
 def _translate_text(text, source, target, quick=False):
-    """Try providers in order. quick=True skips Google's retry loop
+    """Try providers in order. quick=True skips Google's first retry loop
     (used when we already know Google just failed for the whole batch,
     to avoid re-hammering a dead endpoint for every single item)."""
     if not quick:
         result = _translate_google(text, source, target)
         if result is not None:
             return result
-    return _translate_mymemory(text, source, target)
+
+    mm_source = source if source != "auto" else _guess_lang(text)
+    result = _translate_mymemory(text, mm_source, target)
+    if result is not None:
+        return result
+
+    # Last resort: a temporary block/rate-limit on Google's side often
+    # clears within a few seconds - worth one more slow, low-effort try
+    # before finally giving up and leaving the segment untranslated.
+    time.sleep(3 + random.uniform(0, 2))
+    return _translate_google(text, source, target, retries=2)
 
 
 def fetch_translation(text, source="auto", target="zh-TW", quick=False):
@@ -377,11 +475,15 @@ def fetch_translation(text, source="auto", target="zh-TW", quick=False):
     translated = _translate_text(protected, source, target, quick=quick)
     if translated is not None:
         result = restore_protected(translated, tokens)
+        # Only cache real successes. Caching a failure (result == core)
+        # would permanently "poison" this segment: every future run,
+        # including after fixing whatever caused the failure, would hit
+        # this cache entry and skip retranslating it forever.
+        cache_set(core, source, target, result)
     else:
         _fail_counter.inc()
         result = core
 
-    cache_set(core, source, target, result)
     return result
 
 
@@ -1020,6 +1122,17 @@ class TranslatorApp(tk.Tk):
         )
         self.theme_btn.pack(side="right", anchor="center")
 
+        self.clear_cache_btn = ModernPillButton(
+            self.header,
+            text="Clear Cache",
+            command=self.on_clear_cache,
+            font=("Segoe UI", 8, "bold"),
+            radius=6,
+            height=28,
+            width=92,
+        )
+        self.clear_cache_btn.pack(side="right", anchor="center", padx=(0, 8))
+
         # File Section
         self.file_card = tk.Frame(self, highlightthickness=1)
         self.file_card.pack(fill="x", padx=24, pady=8)
@@ -1134,6 +1247,20 @@ class TranslatorApp(tk.Tk):
             height=28,
             width=130,
         )
+
+    def on_clear_cache(self):
+        if messagebox.askyesno(
+            "Clear Cache",
+            "This deletes all cached translations from previous runs.\n\n"
+            "Do this if past runs left segments untranslated - a bug in "
+            "older versions could permanently mark a failed segment as "
+            "'done'. After clearing, everything will be re-translated "
+            "from scratch on the next run.",
+        ):
+            if clear_cache():
+                messagebox.showinfo("Clear Cache", "Cache cleared.")
+            else:
+                messagebox.showerror("Clear Cache", "Could not clear the cache file. See console for details.")
 
     def toggle_theme(self):
         self.set_theme("light" if self.theme_mode == "dark" else "dark")
@@ -1353,7 +1480,14 @@ def run_cli():
     parser.add_argument("-o", "--output", help="Output file")
     parser.add_argument("--source", default="auto", help="Source language")
     parser.add_argument("--target", default="zh-TW", help="Target language")
+    parser.add_argument("--clear-cache", action="store_true",
+                         help="Wipe the persistent translation cache before running "
+                              "(use this if a previous run left segments stuck untranslated)")
     args = parser.parse_args()
+
+    if args.clear_cache:
+        clear_cache()
+        print("[translator] Cache cleared.")
 
     ext = os.path.splitext(args.input)[1].lower()
     if ext not in HANDLERS:
